@@ -407,3 +407,115 @@ void loop() {
 
   delay(100);
 }
+
+// ================================================================
+// TRABAJO FUTURO - MEJORAS Y MODIFICACIONES PENDIENTES
+// ================================================================
+//
+// El presente código corresponde a una primera versión del sistema
+// de control. La lógica general se encuentra implementada, pero
+// algunos parámetros y funciones deberán definirse o ajustarse
+// durante el diseño, construcción y prueba del prototipo.
+//
+// 1. DISEÑO MECÁNICO DEL BRAZO
+//    - Definir dimensiones y longitud de los eslabones.
+//    - Determinar el alcance necesario del brazo.
+//    - Definir la ubicación del brazo respecto a la cinta y al rack.
+//    - Verificar que las posiciones necesarias sean alcanzables.
+//
+// 2. SELECCIÓN DE SERVOMOTORES
+//    - Calcular el torque necesario en cada articulación.
+//    - Considerar el peso de los eslabones, servos, electroimán
+//      y piezas transportadas.
+//    - Seleccionar los servomotores definitivos según los resultados.
+//
+// 3. CALIBRACIÓN DE POSICIONES DEL BRAZO
+//    - Definir los ángulos reales de:
+//          HOME
+//          POS_TORNILLO
+//          POS_TUERCA
+//          POS_ARANDELA
+//          POS_CONTENEDOR
+//    - Estos valores se determinarán con el brazo construido.
+//
+// 4. CALIBRACIÓN DE SERVOMOTORES
+//    - Ajustar los valores PWM mínimos y máximos del PCA9685.
+//    - Verificar los límites mecánicos de cada articulación.
+//    - Evitar movimientos que puedan producir choques o esfuerzos
+//      innecesarios en la estructura.
+//
+// 5. MOVIMIENTO SUAVE DEL BRAZO
+//    - Implementar movimientos progresivos entre posiciones.
+//    - Reducir movimientos bruscos, vibraciones y golpes.
+//    - Ajustar velocidades según cada articulación.
+//
+// 6. CALIBRACIÓN DEL SENSOR TCS3200
+//    - Obtener experimentalmente las lecturas de los contenedores.
+//    - Definir los rangos correspondientes a rojo, verde y azul.
+//    - Completar la función leerColor() utilizando esos valores.
+//    - Evaluar posibles variaciones por iluminación y distancia.
+//
+// 7. AJUSTE DEL SENSOR E18-D80NK
+//    - Calibrar la distancia de detección.
+//    - Definir su posición respecto a la cinta transportadora.
+//    - Verificar posibles falsas detecciones.
+//    - Implementar correctamente la interfaz eléctrica con el ESP32.
+//
+// 8. DISEÑO Y CALIBRACIÓN DEL TOPE
+//    - Construir el mecanismo físico de detención del contenedor.
+//    - Ajustar TOPE_ACTIVO y TOPE_LIBRE según el mecanismo real.
+//    - Verificar que el recipiente quede correctamente posicionado.
+//
+// 9. ELECTROIMÁN
+//    - Seleccionar el electroimán definitivo.
+//    - Diseñar la etapa de potencia necesaria para controlarlo.
+//    - Incorporar los elementos de protección correspondientes.
+//    - Comprobar experimentalmente la capacidad de sujeción de
+//      tornillos, tuercas y arandelas.
+//
+// 10. CINTA TRANSPORTADORA
+//     - Definir el motor y el driver utilizados.
+//     - Incorporar el control de marcha y parada desde el ESP32.
+//     - Sincronizar la cinta con el sensor, el tope y el brazo.
+//
+// 11. CONTROL DE STOCK
+//     - Incorporar sensores para detectar la disponibilidad de
+//       tornillos, tuercas y arandelas en el rack.
+//     - Evitar solicitar una pieza cuando no exista stock.
+//     - Implementar una pausa general si no queda ninguna pieza.
+//
+// 12. SISTEMA DE RECHAZO / DESVÍO
+//     - Definir físicamente cómo se desviarán los contenedores
+//       que no puedan ser procesados.
+//     - Utilizar este sistema cuando el color no sea reconocido
+//       o cuando no exista stock de la pieza correspondiente.
+//
+// 13. MANEJO DE ERRORES
+//     - Detectar posibles fallos de sensores.
+//     - Detectar contenedores atascados.
+//     - Evaluar métodos para verificar que la pieza fue recogida.
+//     - Incorporar estados de alarma y recuperación del sistema.
+//
+// 14. OPTIMIZACIÓN DEL PROGRAMA
+//     - Evaluar el reemplazo de delay() por temporización con millis().
+//     - Considerar una máquina de estados para permitir que el ESP32
+//       supervise varias partes del sistema simultáneamente.
+//
+// 15. INTERFAZ Y SUPERVISIÓN
+//     - Definir la comunicación entre el ESP32 y la interfaz gráfica.
+//     - Mostrar información como:
+//          * Estado del sistema.
+//          * Contenedor detectado.
+//          * Color identificado.
+//          * Pieza seleccionada.
+//          * Estado del stock.
+//          * Alarmas y errores.
+//     - Incorporar funciones de pausa, reinicio o control manual.
+//
+// ================================================================
+// NOTA:
+// Los valores actuales correspondientes a posiciones, ángulos,
+// tiempos y PWM son iniciales o provisionales. Los valores definitivos
+// serán determinados mediante cálculos, calibración y pruebas sobre
+// el prototipo físico.
+// ================================================================
