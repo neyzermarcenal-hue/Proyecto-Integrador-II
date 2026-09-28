@@ -1,0 +1,409 @@
+#include <Wire.h>                        // permite la comunicación I²C entre ESP32 y PCA9685.
+#include <Adafruit_PWMServoDriver.h>     // permite controlar el PCA9685 sin tener que programar manualmente toda la generación de PWM.
+
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+
+// ================================
+// SENSOR DE CONTENEDOR
+// ================================
+const int sensorContenedor = 34;  
+// Solo necesitamos LEER, sirve como entrada
+
+
+// ================================
+// SENSOR DE COLOR TCS3200
+// ================================
+const int S0  = 25;
+const int S1  = 26;
+const int S2  = 27;
+const int S3  = 32;
+const int OUT = 35;
+
+// S0, S1, S2 y S3: el ESP32 envía señales al sensor
+// OUT: el ESP32 recibe la señal del sensor
+
+
+// ================================
+// ACTUADORES
+// ================================
+const int electroiman = 23;
+// Salida para ordenar ON/OFF a través del circuito de potencia
+
+
+// ================================
+// COMUNICACIÓN PCA9685 - I2C
+// ================================
+const int SDA_PIN = 21;
+const int SCL_PIN = 22;
+
+// ================================
+// CANALES PCA9685
+// ================================
+
+const int SERVO_BASE   = 0;
+const int SERVO_HOMBRO = 1;
+const int SERVO_CODO   = 2;
+const int SERVO_MUNECA = 3;
+const int SERVO_TOPE   = 4;
+
+// El PCA9685 tiene 16 canales, pero nosotros usamos por ahora cinco.
+
+// ================================
+// POSICIONES DEL TOPE
+// ================================
+
+// Valores provisionales: se ajustarán durante la calibración
+const int TOPE_ACTIVO = 90;
+const int TOPE_LIBRE  = 0;
+
+// ================================
+// VARIABLES DEL SISTEMA
+// ================================
+
+bool contenedorDetectado = false;
+// Indica si hay un contenedor en la estación
+
+enum Color {
+  ROJO,        // TORNILLOS
+  VERDE,       // TUERCAS
+  AZUL,        // ARANDELAS
+  DESCONOCIDO  // REINTENTAR / RECHAZAR
+};
+
+Color colorDetectado = DESCONOCIDO;
+
+
+// ================================
+// POSICIONES DEL BRAZO
+// ================================
+
+struct PosicionBrazo {
+  int base;
+  int hombro;
+  int codo;
+  int muneca;
+};
+
+PosicionBrazo HOME;
+PosicionBrazo POS_TORNILLO;
+PosicionBrazo POS_TUERCA;
+PosicionBrazo POS_ARANDELA;
+PosicionBrazo POS_CONTENEDOR;
+
+// ================================
+// CONFIGURACIÓN INICIAL
+// ================================
+
+void setup() {
+
+  // Inicia la comunicación entre el ESP32 y la computadora
+  Serial.begin(115200);
+
+  Serial.println("Iniciando sistema...");
+
+  // ================================
+  // CONFIGURACIÓN DE PINES
+  // ================================
+
+  // Sensor de contenedor: el ESP32 recibe información
+  pinMode(sensorContenedor, INPUT);
+
+  // TCS3200: el ESP32 controla S0, S1, S2 y S3
+  pinMode(S0, OUTPUT);
+  pinMode(S1, OUTPUT);
+  pinMode(S2, OUTPUT);
+  pinMode(S3, OUTPUT);
+
+  // OUT envía al ESP32 la señal medida por el TCS3200
+  pinMode(OUT, INPUT);
+
+  // El ESP32 controla el electroimán
+  pinMode(electroiman, OUTPUT);
+
+  // El sistema comienza con el electroimán apagado
+  digitalWrite(electroiman, LOW);
+
+  // ================================
+  // CONFIGURACIÓN DEL TCS3200
+  // ================================
+
+  // Configura la frecuencia de salida del sensor al 20 %
+  digitalWrite(S0, HIGH);
+  digitalWrite(S1, LOW);
+
+  Serial.println("TCS3200 configurado.");
+  Serial.println("Pines configurados.");
+
+  // ================================
+  // CONFIGURACIÓN DEL PCA9685
+  // ================================
+
+  // Inicia la comunicación I2C
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // Inicia el controlador PCA9685
+  pwm.begin();
+
+  // Frecuencia típica para servomotores
+  pwm.setPWMFreq(50);
+
+  Serial.println("PCA9685 configurado.");
+}
+
+// ================================
+// FUNCIÓN PARA MOVER UN SERVO
+// ================================
+
+void moverServo(int canal, int angulo) {
+
+  // Limita el ángulo entre 0° y 180°
+  angulo = constrain(angulo, 0, 180); 
+
+  // Convierte el ángulo al valor PWM utilizado por el PCA9685
+  int pulso = map(angulo, 0, 180, 102, 512);
+
+  // Envía la señal PWM al canal correspondiente
+  pwm.setPWM(canal, 0, pulso);
+}
+
+
+// ================================
+// FUNCIÓN PARA MOVER EL BRAZO
+// ================================
+
+void moverBrazo(PosicionBrazo posicion) {
+
+  // Mueve cada articulación al ángulo indicado
+  moverServo(SERVO_BASE, posicion.base);
+  moverServo(SERVO_HOMBRO, posicion.hombro);
+  moverServo(SERVO_CODO, posicion.codo);
+  moverServo(SERVO_MUNECA, posicion.muneca);
+}
+
+// ================================
+// CONTROL DEL ELECTROIMÁN
+// ================================
+
+void activarElectroiman() {
+
+  digitalWrite(electroiman, HIGH);
+
+  Serial.println("Electroiman ACTIVADO");
+}
+
+
+void desactivarElectroiman() {
+
+  digitalWrite(electroiman, LOW);
+
+  Serial.println("Electroiman DESACTIVADO");
+}
+
+// ================================
+// DETECCIÓN DEL CONTENEDOR
+// ================================
+
+bool detectarContenedor() {
+
+  // El E18-D80NK utiliza una salida activa en LOW
+  if (digitalRead(sensorContenedor) == LOW) {
+
+    Serial.println("Contenedor detectado");
+    return true;
+  }
+
+  return false;
+}
+
+// ================================
+// LECTURA DEL SENSOR DE COLOR
+// ================================
+
+unsigned long medirColor(int estadoS2, int estadoS3) {
+
+  // Selecciona el filtro de color del TCS3200
+  digitalWrite(S2, estadoS2);
+  digitalWrite(S3, estadoS3);
+
+  // Pequeña espera para estabilizar la lectura
+  delay(10);
+
+  // Mide la duración de un pulso recibido desde OUT
+  unsigned long lectura = pulseIn(OUT, LOW, 30000);
+
+  return lectura;
+}
+
+// ================================
+// IDENTIFICACIÓN DEL COLOR
+// ================================
+
+Color leerColor() {
+
+  // Mide los tres componentes de color
+  unsigned long rojo  = medirColor(LOW, LOW);
+  unsigned long azul  = medirColor(LOW, HIGH);
+  unsigned long verde = medirColor(HIGH, HIGH);
+
+  // Muestra las mediciones en el monitor serie
+  // para poder calibrar el sensor posteriormente
+  Serial.print("Rojo: ");
+  Serial.print(rojo);
+
+  Serial.print(" | Verde: ");
+  Serial.print(verde);
+
+  Serial.print(" | Azul: ");
+  Serial.println(azul);
+
+  // Por ahora no se clasifica el color,
+  // ya que primero debemos calibrar el sensor.
+  return DESCONOCIDO;
+}
+
+// ================================
+// LECTURA DEL COLOR CON REINTENTOS
+// ================================
+
+Color leerColorConReintentos() {
+
+  const int MAX_INTENTOS = 3;
+
+  for (int intento = 1; intento <= MAX_INTENTOS; intento++) {
+
+    Serial.print("Intento de lectura: ");
+    Serial.println(intento);
+
+    Color color = leerColor();
+
+    // Si se reconoció un color válido, termina la función
+    if (color != DESCONOCIDO) {
+
+      Serial.println("Color identificado correctamente.");
+      return color;
+    }
+
+    // Si no se reconoció, espera antes de volver a medir
+    Serial.println("Color no identificado. Reintentando...");
+    delay(200);
+  }
+
+  // Si fallaron todos los intentos
+  Serial.println("No fue posible identificar el color.");
+  return DESCONOCIDO;
+}
+
+// ================================
+// TOMAR Y DEPOSITAR UNA PIEZA
+// ================================
+
+void tomarYDepositar(PosicionBrazo posicionPieza) {
+
+  Serial.println("Moviendo brazo hacia la pieza...");
+
+  // 1. Ir a la posición donde está la pieza
+  moverBrazo(posicionPieza);
+  delay(1000);
+
+  // 2. Activar el electroimán para sujetarla
+  activarElectroiman();
+  delay(500);
+
+  // 3. Llevar la pieza hasta el contenedor
+  Serial.println("Moviendo pieza hacia el contenedor...");
+  moverBrazo(POS_CONTENEDOR);
+  delay(1000);
+
+  // 4. Soltar la pieza
+  desactivarElectroiman();
+  delay(500);
+
+  // 5. Regresar a la posición inicial
+  Serial.println("Regresando a HOME...");
+  moverBrazo(HOME);
+  delay(1000);
+}
+
+// ================================
+// CONTROL DEL TOPE
+// ================================
+
+void activarTope() {
+
+  // Coloca el tope para mantener el contenedor en posición
+  moverServo(SERVO_TOPE, TOPE_ACTIVO);
+
+  Serial.println("Tope ACTIVADO");
+
+  // Espera a que el servo complete el movimiento
+  delay(500);
+}
+
+
+void retirarTope() {
+
+  // Retira el tope para liberar el contenedor
+  moverServo(SERVO_TOPE, TOPE_LIBRE);
+
+  Serial.println("Tope RETIRADO");
+
+  // Espera a que el servo complete el movimiento
+  delay(500);
+}
+
+// ================================
+// PROGRAMA PRINCIPAL
+// ================================
+
+void loop() {
+
+  // 1. Verificar si llegó un contenedor
+  contenedorDetectado = detectarContenedor();
+
+  if (contenedorDetectado) {
+
+    Serial.println("Iniciando ciclo de llenado...");
+
+    // 2. Activar el tope para mantener el contenedor en posición
+    activarTope();
+
+    // 3. Identificar el color del contenedor
+    colorDetectado = leerColorConReintentos();
+
+    // 4. Seleccionar la pieza correspondiente
+    switch (colorDetectado) {
+
+      case ROJO:
+        Serial.println("Contenedor ROJO -> TORNILLO");
+        tomarYDepositar(POS_TORNILLO);
+        break;
+
+      case VERDE:
+        Serial.println("Contenedor VERDE -> TUERCA");
+        tomarYDepositar(POS_TUERCA);
+        break;
+
+      case AZUL:
+        Serial.println("Contenedor AZUL -> ARANDELA");
+        tomarYDepositar(POS_ARANDELA);
+        break;
+
+      case DESCONOCIDO:
+        Serial.println("Color desconocido -> CONTENEDOR RECHAZADO");
+        break;
+    }
+
+    // 5. Liberar el contenedor
+    retirarTope();
+
+    // 6. Esperar a que el contenedor abandone la estación
+    while (detectarContenedor()) {
+      delay(100);
+    }
+
+    Serial.println("Ciclo terminado.");
+    Serial.println("Esperando siguiente contenedor...");
+  }
+
+  delay(100);
+}
