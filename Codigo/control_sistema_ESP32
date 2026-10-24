@@ -16,6 +16,35 @@ Adafruit_TCS34725 tcs = Adafruit_TCS34725(
 const int sensorContenedor = 34;  
 // Solo necesitamos LEER, sirve como entrada
 
+// ================================
+// FILTRO DEL SENSOR DE CONTENEDOR
+// ================================
+
+// Tiempo que una lectura debe mantenerse sin cambios
+// antes de aceptarla. Valor provisional para pruebas.
+const unsigned long FILTRO_CONTENEDOR_MS = 100;
+
+// Indica si ya se tomó la primera lectura.
+bool filtroContenedorInicializado = false;
+
+// Última lectura observada y estado aceptado.
+bool lecturaContenedorAnterior = false;
+bool presenciaContenedorEstable = false;
+
+// Indica si ya existe una lectura estable válida.
+bool presenciaContenedorValida = false;
+
+// Momento en que cambió la lectura observada.
+unsigned long ultimoCambioContenedor = 0;
+
+// Tiempo máximo permitido sin obtener una lectura estable.
+// Valor provisional que se ajustará durante las pruebas.
+const unsigned long MAX_INESTABILIDAD_CONTENEDOR_MS = 2000;
+
+// Momento en que comenzó el período sin lectura válida.
+// No se reiniciará con cada cambio de la señal.
+unsigned long inicioInestabilidadContenedor = 0;
+
 
 // ================================
 // SENSOR DE COLOR TCS34725
@@ -31,6 +60,10 @@ const int sensorContenedor = 34;
 // ================================
 const int electroiman = 23;
 // Salida para ordenar ON/OFF a través del circuito de potencia
+
+// Guarda el último estado ordenado al electroimán.
+// No mide corriente ni confirma que haya una pieza.
+bool electroimanActivo = false;
 
 
 // ================================
@@ -50,6 +83,30 @@ const int SERVO_MUNECA = 3;
 const int SERVO_TOPE   = 4;
 
 // El PCA9685 tiene 16 canales, pero nosotros usamos por ahora cinco.
+
+// ================================
+// CALIBRACIÓN INDIVIDUAL DE SERVOS
+// ================================
+
+struct CalibracionServo {
+  int pulsoMin;
+  int pulsoMax;
+  int anguloMin;
+  int anguloMax;
+};
+
+// Valores provisionales: requieren calibración.
+// Pulsos expresados en cuentas del PCA9685 a 50 Hz.
+const CalibracionServo calibracionServos[] = {
+  {102, 512, 0, 180},  // Canal 0: base
+  {102, 512, 0, 180},  // Canal 1: hombro
+  {102, 512, 0, 180},  // Canal 2: codo
+  {102, 512, 0, 180},  // Canal 3: muñeca
+  {102, 512, 0, 180}   // Canal 4: tope
+};
+
+const int CANTIDAD_SERVOS =
+  sizeof(calibracionServos) / sizeof(calibracionServos[0]);
 
 // ================================
 // POSICIONES DEL TOPE
@@ -75,6 +132,78 @@ enum Color {
 
 Color colorDetectado = DESCONOCIDO;
 
+// Indica si el sensor de color se inicializó correctamente.
+// No garantiza que siga conectado durante toda la operación.
+bool sensorColorDisponible = false;
+
+// ================================
+// ESTADOS DEL CICLO AUTOMÁTICO
+// ================================
+
+enum EstadoSistema {
+  ESPERANDO_INICIALIZACION,
+  ESPERANDO_CONTENEDOR,
+  POSICIONANDO_CONTENEDOR,
+  IDENTIFICANDO_COLOR,
+  INICIANDO_RECOGIDA,
+  APROXIMANDO_AL_RACK,
+  ASENTANDO_SOBRE_PIEZA,
+  INICIANDO_BAJADA_A_PIEZA,
+  MOVIENDO_A_PIEZA,
+  ASENTANDO_EN_PIEZA,
+  SUJETANDO_PIEZA,
+  INICIANDO_LEVANTAMIENTO,
+  LEVANTANDO_PIEZA,
+  ASENTANDO_TRAS_LEVANTAMIENTO,
+  INICIANDO_TRASLADO,
+  MOVIENDO_SOBRE_CONTENEDOR,
+  ASENTANDO_SOBRE_CONTENEDOR,
+  INICIANDO_DESCENSO,
+  MOVIENDO_A_CONTENEDOR,
+  ASENTANDO_EN_CONTENEDOR,
+  SOLTANDO_PIEZA,
+  INICIANDO_RETIRADA,
+  RETIRANDO_BRAZO,
+  ASENTANDO_TRAS_RETIRADA,
+  INICIANDO_RETORNO,
+  REGRESANDO_HOME,
+  ASENTANDO_EN_HOME,
+  LIBERANDO_CONTENEDOR,
+  ESPERANDO_SALIDA,
+  SISTEMA_EN_ERROR
+};
+
+// Estado inicial del ciclo.
+EstadoSistema estadoSistema = ESPERANDO_INICIALIZACION;
+
+// Referencia de tiempo para las esperas de cada estado.
+unsigned long inicioEstado = 0;
+
+// ================================
+// REGISTRO DEL ÚLTIMO ERROR
+// ================================
+
+// Apuntará a un texto fijo que describa la causa.
+// Todavía falta actualizarlo al producirse un error.
+const char* ultimoError = "Sin errores registrados";
+
+// ================================
+// CONTROL DE INTENTOS DE COLOR
+// ================================
+
+// Cantidad máxima de lecturas por contenedor.
+const int MAX_INTENTOS_COLOR = 3;
+
+// Tiempo entre intentos.
+// Valor provisional expresado en milisegundos.
+const unsigned long INTERVALO_COLOR_MS = 200;
+
+// Lecturas realizadas durante el ciclo actual.
+int intentosColor = 0;
+
+// Momento de la última lectura.
+unsigned long ultimaLecturaColor = 0;
+
 
 // ================================
 // POSICIONES DEL BRAZO
@@ -94,6 +223,119 @@ PosicionBrazo POS_ARANDELA;
 PosicionBrazo POS_CONTENEDOR;
 
 // ================================
+// POSICIONES DE ELEVACIÓN DESDE EL RACK
+// ================================
+
+// Se definirán con el diseño y la calibración.
+// Los ceros iniciales NO son posiciones verificadas.
+PosicionBrazo POS_ELEVADA_TORNILLO;
+PosicionBrazo POS_ELEVADA_TUERCA;
+PosicionBrazo POS_ELEVADA_ARANDELA;
+
+// Posición de aproximación por encima del contenedor.
+// Sus ángulos se definirán durante la calibración.
+// También servirá como referencia para retirar el brazo
+// después de soltar la pieza.
+PosicionBrazo POS_SOBRE_CONTENEDOR;
+
+// ================================
+// POSICIONES EXCLUSIVAS DE SIMULACIÓN
+// ================================
+
+// Orden de los ángulos: base, hombro, codo, muñeca.
+// Valores ficticios: NO utilizar en el brazo físico.
+namespace Simulacion {
+
+  const PosicionBrazo HOME = {90, 90, 90, 90};
+
+  const PosicionBrazo TORNILLO = {40, 110, 70, 90};
+  const PosicionBrazo TUERCA = {70, 110, 70, 90};
+  const PosicionBrazo ARANDELA = {100, 110, 70, 90};
+
+  const PosicionBrazo ELEVADA_TORNILLO = {40, 90, 90, 90};
+  const PosicionBrazo ELEVADA_TUERCA = {70, 90, 90, 90};
+  const PosicionBrazo ELEVADA_ARANDELA = {100, 90, 90, 90};
+
+  const PosicionBrazo SOBRE_CONTENEDOR = {140, 90, 90, 90};
+  const PosicionBrazo CONTENEDOR = {140, 110, 70, 90};
+}
+
+// Posición de elevación elegida para el ciclo actual.
+// Solo se utilizará cuando haya una selección válida
+// y el brazo esté calibrado.
+PosicionBrazo posicionElevadaSeleccionada = {0, 0, 0, 0};
+
+// ================================
+// ESTADO DE CALIBRACIÓN DEL BRAZO
+// ================================
+
+// Mantener en false hasta definir y verificar:
+// HOME, posiciones del rack, posición del contenedor,
+// límites articulares y recorridos.
+const bool BRAZO_CALIBRADO = false;
+
+// ================================
+// MODO DE SIMULACIÓN
+// ================================
+
+// Mantener en false hasta completar la separación
+// de sensores simulados y salidas físicas.
+const bool MODO_SIMULACION = true;
+
+// Entrada ficticia para las pruebas del filtro.
+// true: hay contenedor; false: no hay contenedor.
+bool contenedorSimulado = false;
+
+// Color ficticio para las pruebas.
+// DESCONOCIDO permite probar los reintentos y el error.
+Color colorSimulado = DESCONOCIDO;
+
+// Permite simular que el sensor de color está disponible
+// o que falla su inicialización.
+bool sensorColorSimuladoDisponible = true;
+
+// Respuesta ficticia del PCA9685 para las pruebas.
+bool pcaSimuladoDisponible = true;
+
+// Posición del rack elegida para el ciclo actual.
+// Solo se utiliza si piezaSeleccionadaValida es true.
+PosicionBrazo posicionPiezaSeleccionada = {0, 0, 0, 0};
+
+// Indica si el color permitió seleccionar una pieza.
+// No confirma stock ni calibración de la posición.
+bool piezaSeleccionadaValida = false;
+
+// ================================
+// REGISTRO DE POSICIÓN DEL BRAZO
+// ================================
+
+// Guarda la última posición ordenada desde el programa.
+// No es una medición de la posición física de los servos.
+PosicionBrazo posicionActual = {0, 0, 0, 0};
+
+// Al iniciar todavía no se ha establecido una posición.
+// Los ceros anteriores no se consideran una posición válida.
+bool posicionActualValida = false;
+
+// ================================
+// CONTROL DEL MOVIMIENTO PROGRESIVO
+// ================================
+
+// Destino solicitado para el movimiento.
+// No se utiliza hasta iniciar un movimiento válido.
+PosicionBrazo posicionDestino = {0, 0, 0, 0};
+
+// Indica si hay un movimiento progresivo en curso.
+bool movimientoEnCurso = false;
+
+// Momento en que se envió el último paso.
+unsigned long ultimoPasoMovimiento = 0;
+
+// Tiempo entre pasos de un grado.
+// Valor provisional que se ajustará con pruebas.
+const unsigned long INTERVALO_PASO_MS = 20;
+
+// ================================
 // CONFIGURACIÓN INICIAL
 // ================================
 
@@ -104,12 +346,53 @@ void setup() {
 
   Serial.println("Iniciando sistema...");
 
+  // En simulación no inicializa pines ni dispositivos físicos.
+  if (MODO_SIMULACION) {
+
+        electroimanActivo = false;
+
+    // Representa la disponibilidad del sensor ficticio.
+    // No confirma la presencia de un sensor físico.
+    sensorColorDisponible = sensorColorSimuladoDisponible;
+
+    Serial.println(
+      "SIMULACION: inicializacion fisica omitida."
+    );
+
+    // Registra únicamente una referencia ficticia.
+    if (!registrarReferenciaInicial(Simulacion::HOME)) {
+
+      registrarError(
+        "No se pudo establecer la referencia simulada."
+      );
+
+      return;
+    }
+
+    Serial.println(
+      "SIMULACION: referencia preparada; ciclo aun detenido."
+    );
+
+    // Termina setup(); luego se ejecutará loop().
+    return;
+  }
+
   // ================================
   // CONFIGURACIÓN DE PINES
   // ================================
 
-  // Sensor de contenedor: el ESP32 recibe información
-  pinMode(sensorContenedor, INPUT);
+    // Configura los pines únicamente en modo físico.
+  if (!MODO_SIMULACION) {
+
+    // Se supone una etapa de potencia activa en HIGH.
+    digitalWrite(electroiman, LOW);
+    pinMode(electroiman, OUTPUT);
+
+    pinMode(sensorContenedor, INPUT);
+  }
+
+  // Estado interno inicial de la orden del electroimán.
+  electroimanActivo = false;
 
   Serial.println("Pines configurados.");
 
@@ -125,19 +408,16 @@ void setup() {
   // ================================
 
   // Intenta iniciar el sensor de color mediante I2C
-  if (tcs.begin()) {
+  sensorColorDisponible = tcs.begin();
+
+  if (sensorColorDisponible) {
 
     Serial.println("TCS34725 configurado.");
 
   } else {
 
-    Serial.println("ERROR: No se encontro el TCS34725.");
+    registrarError("No se encontro el sensor de color TCS34725.");
 
-    // Detiene el programa porque no se puede identificar
-    // el color de los contenedores sin este sensor
-    while (1) {
-      delay(100);
-    }
   }
 
 
@@ -156,16 +436,368 @@ void setup() {
 
 void moverServo(int canal, int angulo) {
 
-  // Limita el ángulo entre 0° y 180°
-  angulo = constrain(angulo, 0, 180); 
+  // Verifica que el canal tenga una calibración definida.
+  if (canal < 0 || canal >= CANTIDAD_SERVOS) {
+    Serial.println("ERROR: Canal de servo no configurado.");
+    return;
+  }
 
-  // Convierte el ángulo al valor PWM utilizado por el PCA9685
-  int pulso = map(angulo, 0, 180, 102, 512);
+  // Obtiene la calibración del servo seleccionado.
+  const CalibracionServo& calibracion =
+    calibracionServos[canal];
 
-  // Envía la señal PWM al canal correspondiente
+  // Limita el ángulo al rango permitido para ese servo.
+  angulo = constrain(
+    angulo,
+    calibracion.anguloMin,
+    calibracion.anguloMax
+  );
+
+  // Convierte el ángulo a cuentas del PCA9685.
+  // pulsoMin y pulsoMax corresponden a 0° y 180°.
+  int pulso = map(
+    angulo,
+    0,
+    180,
+    calibracion.pulsoMin,
+    calibracion.pulsoMax
+  );
+
+  // Envía la señal al servo.
+    if (MODO_SIMULACION) {
+
+    // No envía señales al PCA9685.
+    return;
+  }
+
   pwm.setPWM(canal, 0, pulso);
 }
 
+// ================================
+// AVANCE DE UN ÁNGULO HACIA SU DESTINO
+// ================================
+
+int acercarAngulo(int actual, int destino) {
+
+  if (actual < destino) {
+    return actual + 1;
+  }
+
+  if (actual > destino) {
+    return actual - 1;
+  }
+
+  // Si ya llegó, mantiene el mismo ángulo.
+  return actual;
+}
+
+// ================================
+// CALCULAR EL SIGUIENTE PASO DEL BRAZO
+// ================================
+
+PosicionBrazo calcularPasoBrazo(
+  PosicionBrazo actual,
+  PosicionBrazo destino
+) {
+
+  PosicionBrazo siguiente;
+
+  siguiente.base = acercarAngulo(
+    actual.base, destino.base
+  );
+
+  siguiente.hombro = acercarAngulo(
+    actual.hombro, destino.hombro
+  );
+
+  siguiente.codo = acercarAngulo(
+    actual.codo, destino.codo
+  );
+
+  siguiente.muneca = acercarAngulo(
+    actual.muneca, destino.muneca
+  );
+
+  return siguiente;
+}
+
+// ================================
+// VALIDAR LA TABLA DE CALIBRACIÓN
+// ================================
+
+bool calibracionServosValida() {
+
+  for (int canal = 0; canal < CANTIDAD_SERVOS; canal++) {
+
+    const CalibracionServo& calibracion =
+      calibracionServos[canal];
+
+    bool angulosValidos =
+      calibracion.anguloMin >= 0 &&
+      calibracion.anguloMax <= 180 &&
+      calibracion.anguloMin < calibracion.anguloMax;
+
+    bool pulsosValidos =
+      calibracion.pulsoMin > 0 &&
+      calibracion.pulsoMax <= 4095 &&
+      calibracion.pulsoMin < calibracion.pulsoMax;
+
+    if (!angulosValidos || !pulsosValidos) {
+
+      Serial.print("Calibracion invalida en canal: ");
+      Serial.println(canal);
+
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ================================
+// VALIDAR LOS ÁNGULOS DE UNA POSICIÓN
+// ================================
+
+bool posicionDentroDeLimites(PosicionBrazo posicion) {
+
+  return
+    posicion.base >= calibracionServos[SERVO_BASE].anguloMin &&
+    posicion.base <= calibracionServos[SERVO_BASE].anguloMax &&
+
+    posicion.hombro >= calibracionServos[SERVO_HOMBRO].anguloMin &&
+    posicion.hombro <= calibracionServos[SERVO_HOMBRO].anguloMax &&
+
+    posicion.codo >= calibracionServos[SERVO_CODO].anguloMin &&
+    posicion.codo <= calibracionServos[SERVO_CODO].anguloMax &&
+
+    posicion.muneca >= calibracionServos[SERVO_MUNECA].anguloMin &&
+    posicion.muneca <= calibracionServos[SERVO_MUNECA].anguloMax;
+}
+
+// ================================
+// VALIDAR LAS POSICIONES DEL CICLO
+// ================================
+
+bool posicionesDelCicloValidas() {
+
+  // Primero comprueba la tabla.
+  if (!calibracionServosValida()) {
+    return false;
+  }
+
+  // En simulación comprueba las posiciones ficticias.
+  if (MODO_SIMULACION) {
+
+    return
+      posicionDentroDeLimites(Simulacion::HOME) &&
+      posicionDentroDeLimites(Simulacion::TORNILLO) &&
+      posicionDentroDeLimites(Simulacion::TUERCA) &&
+      posicionDentroDeLimites(Simulacion::ARANDELA) &&
+      posicionDentroDeLimites(Simulacion::ELEVADA_TORNILLO) &&
+      posicionDentroDeLimites(Simulacion::ELEVADA_TUERCA) &&
+      posicionDentroDeLimites(Simulacion::ELEVADA_ARANDELA) &&
+      posicionDentroDeLimites(Simulacion::SOBRE_CONTENEDOR) &&
+      posicionDentroDeLimites(Simulacion::CONTENEDOR);
+  }
+
+  // En modo físico comprueba las posiciones reales.
+  return
+    posicionDentroDeLimites(HOME) &&
+    posicionDentroDeLimites(POS_TORNILLO) &&
+    posicionDentroDeLimites(POS_TUERCA) &&
+    posicionDentroDeLimites(POS_ARANDELA) &&
+    posicionDentroDeLimites(POS_ELEVADA_TORNILLO) &&
+    posicionDentroDeLimites(POS_ELEVADA_TUERCA) &&
+    posicionDentroDeLimites(POS_ELEVADA_ARANDELA) &&
+    posicionDentroDeLimites(POS_SOBRE_CONTENEDOR) &&
+    posicionDentroDeLimites(POS_CONTENEDOR);
+}
+
+// ================================
+// REGISTRAR LA REFERENCIA INICIAL
+// ================================
+
+bool registrarReferenciaInicial(PosicionBrazo referencia) {
+
+  // Verifica la tabla antes de validar la referencia.
+  if (!calibracionServosValida()) {
+
+    registrarError("La tabla de calibracion de servos es invalida.");
+    return false;
+  }
+
+  if (!MODO_SIMULACION && !BRAZO_CALIBRADO) {
+    Serial.println("ERROR: Falta completar la calibracion.");
+    return false;
+  }
+
+  if (
+    estadoSistema != ESPERANDO_INICIALIZACION ||
+    movimientoEnCurso
+  ) {
+    Serial.println(
+      "ERROR: No se puede registrar la referencia en este momento."
+    );
+    return false;
+  }
+
+  if (!posicionDentroDeLimites(referencia)) {
+    Serial.println("ERROR: Referencia fuera de limites.");
+    return false;
+  }
+
+  // Esta referencia debe haberse establecido
+  // y confirmado previamente en el brazo físico.
+  posicionActual = referencia;
+  posicionDestino = referencia;
+  posicionActualValida = true;
+
+  Serial.println(
+    "Referencia registrada. Ciclo automatico aun detenido."
+  );
+
+  return true;
+}
+
+// ================================
+// SOLICITAR EL INICIO DEL CICLO
+// ================================
+
+bool iniciarCicloAutomatico() {
+
+  // Rechaza el inicio si la tabla tiene valores incoherentes.
+  if (!calibracionServosValida()) {
+
+    registrarError("La tabla de calibracion de servos es invalida.");
+    return false;
+  }
+
+  if (!sensorColorDisponible) {
+    Serial.println("ERROR: El sensor de color no esta disponible.");
+    return false;
+  }
+
+  if (!MODO_SIMULACION && !BRAZO_CALIBRADO) {
+    Serial.println("ERROR: Falta completar la calibracion.");
+    return false;
+  }
+
+  // Comprueba todas las posiciones utilizadas por el ciclo.
+  if (!posicionesDelCicloValidas()) {
+
+    registrarError(
+      "Una o mas posiciones del ciclo estan fuera de limites."
+    );
+
+    return false;
+  }
+
+  if (
+    estadoSistema != ESPERANDO_INICIALIZACION ||
+    !posicionActualValida ||
+    movimientoEnCurso
+  ) {
+    Serial.println(
+      "ERROR: Falta una referencia inicial valida o el sistema no esta listo."
+    );
+    return false;
+  }
+
+  // Limpia los datos antes de habilitar el ciclo.
+  piezaSeleccionadaValida = false;
+  colorDetectado = DESCONOCIDO;
+  intentosColor = 0;
+  ultimaLecturaColor = 0;
+
+  cambiarEstado(ESPERANDO_CONTENEDOR);
+
+  Serial.println("Ciclo habilitado. Esperando contenedor.");
+  return true;
+}
+
+// ================================
+// INICIAR UN MOVIMIENTO PROGRESIVO
+// ================================
+
+bool iniciarMovimientoBrazo(PosicionBrazo destino) {
+
+  // Comprueba la tabla antes de utilizar sus límites.
+  if (!calibracionServosValida()) {
+
+    registrarError("La tabla de calibracion de servos es invalida.");
+    return false;
+  }
+
+
+  // Rechaza destinos fuera de los límites configurados.
+  if (!posicionDentroDeLimites(destino)) {
+
+    Serial.println(
+      "Movimiento rechazado: destino fuera de limites."
+    );
+
+    return false;
+  }
+
+  // No usa los ceros iniciales como posición de partida.
+  if (!posicionActualValida) {
+    Serial.println(
+      "ERROR: Falta establecer la posicion inicial del brazo."
+    );
+    return false;
+  }
+
+    // Comprueba la referencia numérica antes de usarla.
+  if (!posicionDentroDeLimites(posicionActual)) {
+
+    posicionActualValida = false;
+
+    Serial.println(
+      "Movimiento rechazado: referencia fuera de limites."
+    );
+
+    return false;
+  }
+
+
+  // Evita reemplazar un movimiento que todavía no terminó.
+  if (movimientoEnCurso) {
+    Serial.println("ERROR: El brazo ya tiene un movimiento en curso.");
+    return false;
+  }
+
+  // Limita el destino según cada articulación.
+  destino.base = constrain(
+    destino.base,
+    calibracionServos[SERVO_BASE].anguloMin,
+    calibracionServos[SERVO_BASE].anguloMax
+  );
+
+  destino.hombro = constrain(
+    destino.hombro,
+    calibracionServos[SERVO_HOMBRO].anguloMin,
+    calibracionServos[SERVO_HOMBRO].anguloMax
+  );
+
+  destino.codo = constrain(
+    destino.codo,
+    calibracionServos[SERVO_CODO].anguloMin,
+    calibracionServos[SERVO_CODO].anguloMax
+  );
+
+  destino.muneca = constrain(
+    destino.muneca,
+    calibracionServos[SERVO_MUNECA].anguloMin,
+    calibracionServos[SERVO_MUNECA].anguloMax
+  );
+
+  posicionDestino = destino;
+  ultimoPasoMovimiento = millis();
+  movimientoEnCurso = true;
+
+  Serial.println("Movimiento progresivo preparado.");
+  return true;
+}
 
 // ================================
 // FUNCIÓN PARA MOVER EL BRAZO
@@ -173,12 +805,87 @@ void moverServo(int canal, int angulo) {
 
 void moverBrazo(PosicionBrazo posicion) {
 
-  // Mueve cada articulación al ángulo indicado
+  // Ajusta cada ángulo a los límites configurados.
+  posicion.base = constrain(
+    posicion.base,
+    calibracionServos[SERVO_BASE].anguloMin,
+    calibracionServos[SERVO_BASE].anguloMax
+  );
+
+  posicion.hombro = constrain(
+    posicion.hombro,
+    calibracionServos[SERVO_HOMBRO].anguloMin,
+    calibracionServos[SERVO_HOMBRO].anguloMax
+  );
+
+  posicion.codo = constrain(
+    posicion.codo,
+    calibracionServos[SERVO_CODO].anguloMin,
+    calibracionServos[SERVO_CODO].anguloMax
+  );
+
+  posicion.muneca = constrain(
+    posicion.muneca,
+    calibracionServos[SERVO_MUNECA].anguloMin,
+    calibracionServos[SERVO_MUNECA].anguloMax
+  );
+
+  // Envía las órdenes a los cuatro servos.
   moverServo(SERVO_BASE, posicion.base);
   moverServo(SERVO_HOMBRO, posicion.hombro);
   moverServo(SERVO_CODO, posicion.codo);
   moverServo(SERVO_MUNECA, posicion.muneca);
+
+  // Guarda los ángulos que se acaban de ordenar.
+  // Esto no confirma que el brazo haya llegado físicamente.
+  posicionActual = posicion;
+  posicionActualValida = true;
 }
+
+// ================================
+// ACTUALIZAR EL MOVIMIENTO PROGRESIVO
+// ================================
+
+void actualizarMovimientoBrazo() {
+
+  if (!movimientoEnCurso) {
+    return;
+  }
+
+   if (!posicionActualValida) {
+    registrarError("Posicion de partida no valida.");
+    return;
+  }
+
+  unsigned long ahora = millis();
+
+  if (ahora - ultimoPasoMovimiento < INTERVALO_PASO_MS) {
+    return;
+  }
+
+  ultimoPasoMovimiento = ahora;
+
+  PosicionBrazo siguiente = calcularPasoBrazo(
+    posicionActual,
+    posicionDestino
+  );
+
+  moverBrazo(siguiente);
+
+  if (
+    posicionActual.base == posicionDestino.base &&
+    posicionActual.hombro == posicionDestino.hombro &&
+    posicionActual.codo == posicionDestino.codo &&
+    posicionActual.muneca == posicionDestino.muneca
+  ) {
+    movimientoEnCurso = false;
+
+    Serial.println(
+      "Destino ordenado. Llegada fisica no verificada."
+    );
+  }
+}
+
 
 // ================================
 // CONTROL DEL ELECTROIMÁN
@@ -186,7 +893,11 @@ void moverBrazo(PosicionBrazo posicion) {
 
 void activarElectroiman() {
 
-  digitalWrite(electroiman, HIGH);
+  if (!MODO_SIMULACION) {
+    digitalWrite(electroiman, HIGH);
+  }
+
+  electroimanActivo = true;
 
   Serial.println("Electroiman ACTIVADO");
 }
@@ -194,7 +905,10 @@ void activarElectroiman() {
 
 void desactivarElectroiman() {
 
-  digitalWrite(electroiman, LOW);
+  if (!MODO_SIMULACION) {
+    digitalWrite(electroiman, LOW);
+  }
+  electroimanActivo = false;
 
   Serial.println("Electroiman DESACTIVADO");
 }
@@ -203,16 +917,64 @@ void desactivarElectroiman() {
 // DETECCIÓN DEL CONTENEDOR
 // ================================
 
-bool detectarContenedor() {
+// Actualiza la presencia solo después de una lectura estable.
+void actualizarFiltroContenedor() {
 
-  // El E18-D80NK utiliza una salida activa en LOW
-  if (digitalRead(sensorContenedor) == LOW) {
+  unsigned long ahora = millis();
 
-    Serial.println("Contenedor detectado");
-    return true;
+  // La detección se considera activa en LOW.
+    bool lecturaActual;
+
+  if (MODO_SIMULACION) {
+    lecturaActual = contenedorSimulado;
+  } else {
+    // En modo físico, la detección es activa en LOW.
+    lecturaActual = digitalRead(sensorContenedor) == LOW;
   }
 
-  return false;
+  // La primera lectura inicia el tiempo de comprobación.
+  if (!filtroContenedorInicializado) {
+
+    lecturaContenedorAnterior = lecturaActual;
+    ultimoCambioContenedor = ahora;
+    inicioInestabilidadContenedor = ahora;
+    presenciaContenedorValida = false;
+    filtroContenedorInicializado = true;
+
+    return;
+  }
+
+  // Si cambia la señal, reinicia la comprobación.
+  if (lecturaActual != lecturaContenedorAnterior) {
+
+    // Inicia un nuevo período de inestabilidad
+    // solo si antes había una lectura válida.
+    if (presenciaContenedorValida) {
+      inicioInestabilidadContenedor = ahora;
+    }
+
+    lecturaContenedorAnterior = lecturaActual;
+    ultimoCambioContenedor = ahora;
+    presenciaContenedorValida = false;
+
+    return;
+  }
+
+  // Acepta la lectura cuando se mantiene estable.
+  if (
+    !presenciaContenedorValida &&
+    ahora - ultimoCambioContenedor >= FILTRO_CONTENEDOR_MS
+  ) {
+
+    presenciaContenedorEstable = lecturaActual;
+    presenciaContenedorValida = true;
+  }
+}
+
+bool detectarContenedor() {
+
+  return presenciaContenedorValida &&
+         presenciaContenedorEstable;
 }
 
 // ================================
@@ -224,6 +986,12 @@ bool detectarContenedor() {
 // ================================
 
 Color leerColor() {
+
+  if (MODO_SIMULACION) {
+
+    Serial.println("SIMULACION: lectura de color ficticia.");
+    return colorSimulado;
+  }
 
   // Variables donde se guardarán las mediciones
   // realizadas por el TCS34725
@@ -287,6 +1055,76 @@ Color leerColorConReintentos() {
 }
 
 // ================================
+// SELECCIONAR LA PIEZA SEGÚN EL COLOR
+// ================================
+
+bool seleccionarPieza(Color color) {
+
+   // Borra las selecciones del ciclo anterior.
+  piezaSeleccionadaValida = false;
+
+  posicionPiezaSeleccionada = {0, 0, 0, 0};
+  posicionElevadaSeleccionada = {0, 0, 0, 0};
+
+  switch (color) {
+
+    case ROJO:
+            if (MODO_SIMULACION) {
+
+        posicionPiezaSeleccionada = Simulacion::TORNILLO;
+        posicionElevadaSeleccionada =
+          Simulacion::ELEVADA_TORNILLO;
+
+      } else {
+
+        posicionPiezaSeleccionada = POS_TORNILLO;
+        posicionElevadaSeleccionada = POS_ELEVADA_TORNILLO;
+      }
+      Serial.println("Seleccion: TORNILLO");
+      break;
+
+    case VERDE:
+        if (MODO_SIMULACION) {
+
+        posicionPiezaSeleccionada = Simulacion::TUERCA;
+        posicionElevadaSeleccionada =
+          Simulacion::ELEVADA_TUERCA;
+
+      } else {
+
+        posicionPiezaSeleccionada = POS_TUERCA;
+        posicionElevadaSeleccionada = POS_ELEVADA_TUERCA;
+      }
+      Serial.println("Seleccion: TUERCA");
+      break;
+
+    case AZUL:
+        if (MODO_SIMULACION) {
+
+        posicionPiezaSeleccionada = Simulacion::ARANDELA;
+        posicionElevadaSeleccionada =
+          Simulacion::ELEVADA_ARANDELA;
+
+      } else {
+
+        posicionPiezaSeleccionada = POS_ARANDELA;
+        posicionElevadaSeleccionada = POS_ELEVADA_ARANDELA;
+      }
+      Serial.println("Seleccion: ARANDELA");
+      break;
+
+    default:
+      Serial.println("No se pudo seleccionar una pieza.");
+      return false;
+  }
+
+  // Confirma la selección de ambas posiciones por color.
+  // No confirma calibración, stock ni pieza recogida.
+  piezaSeleccionadaValida = true;
+  return true;
+}
+
+// ================================
 // TOMAR Y DEPOSITAR UNA PIEZA
 // ================================
 
@@ -345,171 +1183,1066 @@ void retirarTope() {
 }
 
 // ================================
+// CAMBIAR EL ESTADO DEL SISTEMA
+// ================================
+
+void cambiarEstado(EstadoSistema nuevoEstado) {
+
+  // Cancela el envío de nuevos pasos al entrar en error.
+  if (nuevoEstado == SISTEMA_EN_ERROR) {
+
+    movimientoEnCurso = false;
+
+    // Conserva la última posición ordenada como destino.
+    posicionDestino = posicionActual;
+
+    // No apaga el electroimán:
+    // podría estar sosteniendo una pieza.
+    Serial.println(
+      "ERROR: Movimiento progresivo cancelado."
+    );
+  }
+
+  estadoSistema = nuevoEstado;
+
+  // Guarda el momento de entrada al nuevo estado.
+  inicioEstado = millis();
+}
+
+// ================================
+// REGISTRAR UN ERROR DEL SISTEMA
+// ================================
+
+void registrarError(const char* mensaje) {
+
+  // Conserva la causa original si ya estamos en error.
+  if (estadoSistema == SISTEMA_EN_ERROR) {
+    return;
+  }
+
+  // Usar textos fijos entre comillas al llamar esta función.
+  ultimoError = mensaje;
+
+  Serial.print("Causa del error: ");
+  Serial.println(ultimoError);
+
+  // Cancela los pasos pendientes y conserva
+  // el estado del electroimán.
+  cambiarEstado(SISTEMA_EN_ERROR);
+}
+
+// ================================
+// COMPROBAR RESPUESTA EN EL BUS I2C
+// ================================
+
+bool dispositivoI2CResponde(uint8_t direccion) {
+
+  if (MODO_SIMULACION) {
+
+    // Por ahora solo simulamos la consulta al PCA9685.
+    if (direccion == 0x40) {
+      return pcaSimuladoDisponible;
+    }
+
+    return false;
+  }
+
+  Wire.beginTransmission(direccion);
+
+  return Wire.endTransmission() == 0;
+}
+
+// ================================
+// PREPARAR UNA NUEVA INICIALIZACIÓN
+// ================================
+
+bool prepararNuevaInicializacion() {
+
+  // Solo permite esta operación desde el estado de error.
+  if (estadoSistema != SISTEMA_EN_ERROR) {
+    Serial.println("ERROR: El sistema no esta en estado de error.");
+    return false;
+  }
+
+  // Podría haber una pieza sostenida.
+  // No apaga el electroimán automáticamente.
+  if (electroimanActivo) {
+
+    Serial.println(
+      "Recuperacion bloqueada: electroiman activado."
+    );
+
+    Serial.println(
+      "Se requiere resolver la sujecion de la pieza antes de continuar."
+    );
+
+    return false;
+  }
+
+  // Exige una lectura estable antes de evaluar la estación.
+  if (!presenciaContenedorValida) {
+
+    Serial.println(
+      "Recuperacion bloqueada: lectura de presencia sin estabilizar."
+    );
+
+    return false;
+  }
+
+  // No continúa si el sensor todavía detecta un contenedor.
+  if (presenciaContenedorEstable) {
+
+    Serial.println(
+      "Recuperacion bloqueada: hay un contenedor en la estacion."
+    );
+
+    return false;
+  }
+
+    // Usa el sensor ficticio o el físico según el modo.
+  if (MODO_SIMULACION) {
+    sensorColorDisponible = sensorColorSimuladoDisponible;
+  } else {
+    sensorColorDisponible = tcs.begin();
+  }
+
+  if (!sensorColorDisponible) {
+
+    Serial.println(
+      "Recuperacion bloqueada: no se encuentra el sensor de color."
+    );
+
+    return false;
+  }
+
+  // Dirección correspondiente al PCA9685 configurado
+  // con el constructor predeterminado de nuestro código.
+  if (!dispositivoI2CResponde(0x40)) {
+
+    Serial.println(
+      "Recuperacion bloqueada: no responde el PCA9685 en 0x40."
+    );
+
+    return false;
+  }
+
+  // Cancela cualquier movimiento pendiente.
+  movimientoEnCurso = false;
+
+  // Exige establecer nuevamente la referencia física.
+  posicionActualValida = false;
+
+  // Limpia las selecciones del ciclo interrumpido.
+  piezaSeleccionadaValida = false;
+  colorDetectado = DESCONOCIDO;
+  intentosColor = 0;
+  ultimaLecturaColor = 0;
+
+  // Conserva el error registrado para poder consultarlo.
+  // No cambia el electroimán ni el tope.
+  // No abandona todavía el estado de error.
+  Serial.println(
+    "Comprobaciones de preparacion superadas. Referencia invalidada; sistema aun en error."
+  );
+
+  return true;
+}
+
+// ================================
+// COMPROBAR EL TIEMPO EN UN ESTADO
+// ================================
+
+bool tiempoEstadoCumplido(unsigned long duracionMs) {
+
+  return millis() - inicioEstado >= duracionMs;
+}
+
+// ================================
+// CONSULTAR EL ESTADO POR PUERTO SERIE
+// ================================
+
+void atenderComandosSerie() {
+
+  if (Serial.available() <= 0) {
+    return;
+  }
+
+  char comando = Serial.read();
+
+  // Ignora los saltos de línea del Monitor Serie.
+  if (comando == '\n' || comando == '\r') {
+    return;
+  }
+
+  if (comando == '?') {
+
+    Serial.println("--- ESTADO DEL SISTEMA ---");
+    Serial.print("Ultimo error registrado: ");
+    Serial.println(ultimoError);
+
+    Serial.print("Sensor de color inicializado: ");
+    Serial.println(sensorColorDisponible ? "SI" : "NO");
+
+    Serial.print("Lectura de presencia valida: ");
+    Serial.println(presenciaContenedorValida ? "SI" : "NO");
+
+    Serial.print("Contenedor presente: ");
+
+    if (presenciaContenedorValida) {
+      Serial.println(presenciaContenedorEstable ? "SI" : "NO");
+    } else {
+      Serial.println("SIN LECTURA ESTABLE");
+    }
+
+    Serial.print("Brazo calibrado: ");
+    Serial.println(BRAZO_CALIBRADO ? "SI" : "NO");
+
+    Serial.print("Referencia registrada: ");
+    Serial.println(posicionActualValida ? "SI" : "NO");
+
+    Serial.print("Movimiento en curso: ");
+    Serial.println(movimientoEnCurso ? "SI" : "NO");
+
+    Serial.print("Estado del ciclo (numero): ");
+    Serial.println((int)estadoSistema);
+
+      } else if (comando == '1' || comando == '0') {
+
+    if (!MODO_SIMULACION) {
+
+      Serial.println(
+        "Comando disponible solo en simulacion."
+      );
+
+    } else {
+
+      contenedorSimulado = (comando == '1');
+
+      Serial.println(
+        contenedorSimulado
+          ? "SIMULACION: contenedor presente."
+          : "SIMULACION: contenedor ausente."
+      );
+    }
+
+    } else if (
+    comando == 't' ||
+    comando == 'u' ||
+    comando == 'a' ||
+    comando == 'x'
+  ) {
+
+    if (!MODO_SIMULACION) {
+
+      Serial.println(
+        "Comando disponible solo en simulacion."
+      );
+
+    } else if (
+      estadoSistema != ESPERANDO_INICIALIZACION &&
+      estadoSistema != ESPERANDO_CONTENEDOR &&
+      estadoSistema != SISTEMA_EN_ERROR
+    ) {
+
+      Serial.println(
+        "No se permite cambiar el color durante el procesamiento."
+      );
+
+    } else {
+
+      switch (comando) {
+
+        case 't':
+          colorSimulado = ROJO;
+          Serial.println("SIMULACION: rojo, tornillo.");
+          break;
+
+        case 'u':
+          colorSimulado = VERDE;
+          Serial.println("SIMULACION: verde, tuerca.");
+          break;
+
+        case 'a':
+          colorSimulado = AZUL;
+          Serial.println("SIMULACION: azul, arandela.");
+          break;
+
+        case 'x':
+          colorSimulado = DESCONOCIDO;
+          Serial.println("SIMULACION: color desconocido.");
+          break;
+      }
+    }
+
+  } else if (comando == 'i' || comando == 'I') {
+
+    iniciarCicloAutomatico();
+
+    } else if (comando == 'p' || comando == 'P') {
+
+      registrarError("Parada solicitada por puerto serie.");
+
+  } else if (comando == 'r' || comando == 'R') {
+
+    if (prepararNuevaInicializacion()) {
+
+      cambiarEstado(ESPERANDO_INICIALIZACION);
+
+      Serial.println(
+        "Recuperacion preparada. Falta establecer una nueva referencia."
+      );
+    }
+
+  } else {
+
+        Serial.println(
+      "Use ?: estado, i: inicio, p: parada, r: preparar reinicializacion."
+    );
+
+    if (MODO_SIMULACION) {
+
+      Serial.println(
+        "SIMULACION: 1: llega contenedor, 0: sale contenedor."
+      );
+
+      Serial.println(
+        "Colores: t: tornillo, u: tuerca, a: arandela, x: desconocido."
+      );
+    }
+  }
+}
+
+// ================================
 // PROGRAMA PRINCIPAL
 // ================================
 
 void loop() {
+   atenderComandosSerie();
+   actualizarFiltroContenedor();
 
-  // 1. Verificar si llegó un contenedor
-  contenedorDetectado = detectarContenedor();
+  // Bloquea el ciclo hasta completar la calibración.
+  if (!MODO_SIMULACION && !BRAZO_CALIBRADO) {
 
-  if (contenedorDetectado) {
+    static bool avisoMostrado = false;
 
-    Serial.println("Iniciando ciclo de llenado...");
-
-    // 2. Activar el tope para mantener el contenedor en posición
-    activarTope();
-
-    // 3. Identificar el color del contenedor
-    colorDetectado = leerColorConReintentos();
-
-    // 4. Seleccionar la pieza correspondiente
-    switch (colorDetectado) {
-
-      case ROJO:
-        Serial.println("Contenedor ROJO -> TORNILLO");
-        tomarYDepositar(POS_TORNILLO);
-        break;
-
-      case VERDE:
-        Serial.println("Contenedor VERDE -> TUERCA");
-        tomarYDepositar(POS_TUERCA);
-        break;
-
-      case AZUL:
-        Serial.println("Contenedor AZUL -> ARANDELA");
-        tomarYDepositar(POS_ARANDELA);
-        break;
-
-      case DESCONOCIDO:
-        Serial.println("Color desconocido -> CONTENEDOR RECHAZADO");
-        break;
+    if (!avisoMostrado) {
+      Serial.println(
+        "Ciclo bloqueado: falta calibrar el brazo."
+      );
+      avisoMostrado = true;
     }
 
-    // 5. Liberar el contenedor
-    retirarTope();
-
-    // 6. Esperar a que el contenedor abandone la estación
-    while (detectarContenedor()) {
-      delay(100);
-    }
-
-    Serial.println("Ciclo terminado.");
-    Serial.println("Esperando siguiente contenedor...");
+    return;
   }
 
-  delay(100);
-}
+  // Detecta una señal que permanece sin estabilizarse.
+  // Se supervisa durante el funcionamiento automático.
+  if (
+    estadoSistema != ESPERANDO_INICIALIZACION &&
+    estadoSistema != SISTEMA_EN_ERROR &&
+    filtroContenedorInicializado &&
+    !presenciaContenedorValida &&
+    millis() - inicioInestabilidadContenedor >=
+      MAX_INESTABILIDAD_CONTENEDOR_MS
+  ) {
 
+    registrarError(
+      "La señal del sensor de contenedor no se estabiliza."
+    );
+  }
+
+
+  // Durante el procesamiento, el contenedor debe permanecer
+  // en la zona de detección.
+  bool requiereContenedor =
+    estadoSistema != ESPERANDO_INICIALIZACION &&
+    estadoSistema != ESPERANDO_CONTENEDOR &&
+    estadoSistema != LIBERANDO_CONTENEDOR &&
+    estadoSistema != ESPERANDO_SALIDA &&
+    estadoSistema != SISTEMA_EN_ERROR;
+
+  if (
+    requiereContenedor &&
+    presenciaContenedorValida &&
+    !presenciaContenedorEstable
+  ) {
+
+    registrarError(
+      "Se perdio la presencia del contenedor."
+    );
+  }
+
+  // Atiende los pasos de un movimiento ya iniciado.
+  actualizarMovimientoBrazo();
+
+  switch (estadoSistema) {
+
+      case ESPERANDO_INICIALIZACION:
+
+      // Muestra el aviso una sola vez.
+      static bool avisoInicializacionMostrado = false;
+
+      if (!avisoInicializacionMostrado) {
+
+        Serial.println(
+          "Esperando establecer y confirmar la referencia inicial."
+        );
+
+        Serial.println(
+          "El ciclo automatico permanece detenido."
+        );
+
+        avisoInicializacionMostrado = true;
+      }
+      break;
+
+    case ESPERANDO_CONTENEDOR:
+
+      if (detectarContenedor()) {
+
+        // Limpia los datos del ciclo anterior.
+        colorDetectado = DESCONOCIDO;
+        piezaSeleccionadaValida = false;
+
+        // Reinicia los intentos de color para este contenedor.
+        intentosColor = 0;
+        ultimaLecturaColor = 0;
+
+        // Ordena colocar el tope sin detener el programa.
+        moverServo(SERVO_TOPE, TOPE_ACTIVO);
+
+        Serial.println("Posicionando contenedor...");
+
+        cambiarEstado(POSICIONANDO_CONTENEDOR);
+      }
+
+      break;
+
+    case POSICIONANDO_CONTENEDOR:
+
+      // Tiempo provisional para el movimiento del tope.
+      if (tiempoEstadoCumplido(500)) {
+        cambiarEstado(IDENTIFICANDO_COLOR);
+      }
+
+      break;
+
+    case IDENTIFICANDO_COLOR: {
+
+      unsigned long ahora = millis();
+
+      // La primera lectura se realiza inmediatamente.
+      // Las siguientes esperan el intervalo indicado.
+      if (
+        intentosColor > 0 &&
+        ahora - ultimaLecturaColor < INTERVALO_COLOR_MS
+      ) {
+        break;
+      }
+
+      intentosColor++;
+
+      Serial.print("Intento de color: ");
+      Serial.println(intentosColor);
+
+      colorDetectado = leerColor();
+
+      // Cuenta el intervalo desde que terminó la lectura.
+      ultimaLecturaColor = millis();
+
+      if (colorDetectado != DESCONOCIDO) {
+
+        if (seleccionarPieza(colorDetectado)) {
+          cambiarEstado(INICIANDO_RECOGIDA);
+        } else {
+          registrarError("No se pudo seleccionar la pieza.");
+        }
+
+      } else if (intentosColor >= MAX_INTENTOS_COLOR) {
+
+      // El desvío y la recuperación siguen pendientes.
+        registrarError(
+          "Color desconocido tras tres intentos."
+        );
+      }
+
+      break;
+    }
+
+        case INICIANDO_RECOGIDA:
+
+      if (!piezaSeleccionadaValida) {
+
+        registrarError("No hay una pieza seleccionada.");
+
+      } else if (
+        iniciarMovimientoBrazo(posicionElevadaSeleccionada)
+      ) {
+
+        cambiarEstado(APROXIMANDO_AL_RACK);
+
+      } else {
+
+        registrarError("No se pudo iniciar la aproximacion al rack.");
+      }
+
+      break;
+
+    case APROXIMANDO_AL_RACK:
+
+      if (!posicionActualValida) {
+
+         registrarError("Referencia de posicion perdida.");
+
+      } else if (!movimientoEnCurso) {
+
+        cambiarEstado(ASENTANDO_SOBRE_PIEZA);
+      }
+
+      break;
+
+    case ASENTANDO_SOBRE_PIEZA:
+
+      // Espera provisional después del último paso ordenado.
+      if (tiempoEstadoCumplido(500)) {
+        cambiarEstado(INICIANDO_BAJADA_A_PIEZA);
+      }
+
+      break;
+
+    case INICIANDO_BAJADA_A_PIEZA:
+
+      if (iniciarMovimientoBrazo(posicionPiezaSeleccionada)) {
+
+        cambiarEstado(MOVIENDO_A_PIEZA);
+
+      } else {
+
+        registrarError("No se pudo iniciar la bajada hacia la pieza.");
+      }
+
+      break;
+
+        case MOVIENDO_A_PIEZA:
+
+      // Espera hasta terminar de enviar los pasos.
+      if (!posicionActualValida) {
+
+         registrarError("Referencia de posicion perdida.");
+
+      } else if (!movimientoEnCurso) {
+
+        cambiarEstado(ASENTANDO_EN_PIEZA);
+      }
+
+      break;
+
+    case ASENTANDO_EN_PIEZA:
+
+      // Espera adicional desde el último paso ordenado.
+      // Tiempo provisional: requiere pruebas físicas.
+      if (tiempoEstadoCumplido(500)) {
+
+        activarElectroiman();
+        cambiarEstado(SUJETANDO_PIEZA);
+      }
+
+      break;
+
+    case SUJETANDO_PIEZA:
+
+      // Tiempo provisional para establecer la sujeción.
+      // No confirma que se haya recogido una pieza.
+      if (tiempoEstadoCumplido(500)) {
+
+        Serial.println(
+          "Espera de sujecion terminada."
+        );
+
+        cambiarEstado(INICIANDO_LEVANTAMIENTO);
+      }
+
+      break;
+
+        case INICIANDO_LEVANTAMIENTO:
+
+      if (!piezaSeleccionadaValida) {
+
+        registrarError("Falta seleccionar la posicion de elevacion.");
+
+      } else if (
+        iniciarMovimientoBrazo(posicionElevadaSeleccionada)
+      ) {
+
+        cambiarEstado(LEVANTANDO_PIEZA);
+
+      } else {
+
+        registrarError("No se pudo iniciar la elevacion de la pieza.");
+      }
+
+      break;
+
+    case LEVANTANDO_PIEZA:
+
+      if (!posicionActualValida) {
+
+        registrarError("Referencia de posicion perdida.");
+
+      } else if (!movimientoEnCurso) {
+
+        cambiarEstado(ASENTANDO_TRAS_LEVANTAMIENTO);
+      }
+
+      break;
+
+    case ASENTANDO_TRAS_LEVANTAMIENTO:
+
+      // Tiempo provisional después del último paso ordenado.
+      if (tiempoEstadoCumplido(500)) {
+        cambiarEstado(INICIANDO_TRASLADO);
+      }
+
+      break;
+
+    case INICIANDO_TRASLADO:
+  
+        if (iniciarMovimientoBrazo(
+        MODO_SIMULACION
+          ? Simulacion::SOBRE_CONTENEDOR
+          : POS_SOBRE_CONTENEDOR
+      )) {
+
+        cambiarEstado(MOVIENDO_SOBRE_CONTENEDOR);
+
+      } else {
+
+        registrarError("No se pudo iniciar el traslado sobre el contenedor.");
+      }
+
+      break;
+
+    case MOVIENDO_SOBRE_CONTENEDOR:
+
+      if (!posicionActualValida) {
+
+        registrarError("Referencia de posicion perdida.");
+
+      } else if (!movimientoEnCurso) {
+
+        cambiarEstado(ASENTANDO_SOBRE_CONTENEDOR);
+      }
+
+      break;
+
+    case ASENTANDO_SOBRE_CONTENEDOR:
+
+      // Espera provisional después del último paso ordenado.
+      if (tiempoEstadoCumplido(500)) {
+        cambiarEstado(INICIANDO_DESCENSO);
+      }
+
+      break;
+
+    case INICIANDO_DESCENSO:
+
+        if (iniciarMovimientoBrazo(
+        MODO_SIMULACION
+          ? Simulacion::CONTENEDOR
+          : POS_CONTENEDOR
+      )) {
+
+        cambiarEstado(MOVIENDO_A_CONTENEDOR);
+
+      } else {
+
+        registrarError("No se pudo iniciar el descenso al contenedor.");
+      }
+
+      break;
+
+    case MOVIENDO_A_CONTENEDOR:
+
+      if (!posicionActualValida) {
+
+        registrarError("Referencia de posicion perdida.");
+
+      } else if (!movimientoEnCurso) {
+
+        cambiarEstado(ASENTANDO_EN_CONTENEDOR);
+      }
+
+      break;
+
+    case ASENTANDO_EN_CONTENEDOR:
+
+      // Espera provisional después del último paso ordenado.
+      if (tiempoEstadoCumplido(500)) {
+
+        desactivarElectroiman();
+        cambiarEstado(SOLTANDO_PIEZA);
+      }
+
+      break;
+
+    case SOLTANDO_PIEZA:
+
+      // Tiempo provisional para permitir que la pieza caiga.
+      // No confirma físicamente que se haya soltado.
+      if (tiempoEstadoCumplido(500)) {
+        cambiarEstado(INICIANDO_RETIRADA);
+      }
+
+      break;
+
+    case INICIANDO_RETIRADA:
+
+        if (iniciarMovimientoBrazo(
+        MODO_SIMULACION
+          ? Simulacion::SOBRE_CONTENEDOR
+          : POS_SOBRE_CONTENEDOR
+      )) {
+
+        cambiarEstado(RETIRANDO_BRAZO);
+
+      } else {
+
+        registrarError("No se pudo iniciar la retirada del brazo.");
+      }
+
+      break;
+
+    case RETIRANDO_BRAZO:
+
+      if (!posicionActualValida) {
+
+        registrarError("Referencia de posicion perdida.");
+
+      } else if (!movimientoEnCurso) {
+
+        cambiarEstado(ASENTANDO_TRAS_RETIRADA);
+      }
+
+      break;
+
+    case ASENTANDO_TRAS_RETIRADA:
+
+      // Espera provisional después del último paso ordenado.
+      if (tiempoEstadoCumplido(500)) {
+        cambiarEstado(INICIANDO_RETORNO);
+      }
+
+      break;
+
+    case INICIANDO_RETORNO:
+
+          if (iniciarMovimientoBrazo(
+        MODO_SIMULACION
+          ? Simulacion::HOME
+          : HOME
+      )) {
+
+        cambiarEstado(REGRESANDO_HOME);
+
+      } else {
+
+        registrarError("No se pudo iniciar el retorno a HOME.");
+      }
+
+      break;
+
+    case REGRESANDO_HOME:
+
+      if (!posicionActualValida) {
+
+         registrarError("Referencia de posicion perdida.");
+
+      } else if (!movimientoEnCurso) {
+
+        cambiarEstado(ASENTANDO_EN_HOME);
+      }
+
+      break;
+
+    case ASENTANDO_EN_HOME:
+
+      // Tiempo provisional para asentarse en HOME.
+      if (tiempoEstadoCumplido(500)) {
+
+        // Retira el tope sin llamar a la función con delay().
+        moverServo(SERVO_TOPE, TOPE_LIBRE);
+
+        Serial.println("Liberando contenedor...");
+        cambiarEstado(LIBERANDO_CONTENEDOR);
+      }
+
+      break;
+
+    case LIBERANDO_CONTENEDOR:
+
+      // Tiempo provisional para retirar el tope.
+      if (tiempoEstadoCumplido(500)) {
+        cambiarEstado(ESPERANDO_SALIDA);
+      }
+
+      break;
+
+    case ESPERANDO_SALIDA:
+
+      if (
+        presenciaContenedorValida &&
+        !presenciaContenedorEstable
+      ) {
+
+        // Limpia las selecciones del ciclo terminado.
+        piezaSeleccionadaValida = false;
+        colorDetectado = DESCONOCIDO;
+
+        Serial.println("Ciclo terminado.");
+        Serial.println("Esperando siguiente contenedor...");
+
+        cambiarEstado(ESPERANDO_CONTENEDOR);
+
+      } else if (tiempoEstadoCumplido(10000)) {
+
+        // Límite provisional de 10 segundos.
+                registrarError(
+          "El contenedor no abandono la estacion en el tiempo previsto."
+        );
+      }
+      break;
+
+    case SISTEMA_EN_ERROR:
+
+      // La recuperación del error se implementará después.
+      break;
+
+    default:
+
+        registrarError("Estado del ciclo inesperado o no implementado.");
+      break;
+  }
+}    
 // ================================================================
-// TRABAJO FUTURO - MEJORAS Y MODIFICACIONES PENDIENTES
+// SEGUIMIENTO DEL PROYECTO - AVANCES Y TRABAJO PENDIENTE
 // ================================================================
 //
-// El presente código corresponde a una primera versión del sistema
-// de control. La lógica general se encuentra implementada, pero
-// algunos parámetros y funciones deberán definirse o ajustarse
-// durante el diseño, construcción y prueba del prototipo.
+// Este seguimiento distingue lo programado de lo comprobado.
+// La compilacion no confirma el funcionamiento fisico.
+// La simulacion interna esta preparada, pero aun falta ejecutarla
+// y verificar sus resultados.
 //
-// 1. DISEÑO MECÁNICO DEL BRAZO
-//    - Definir dimensiones y longitud de los eslabones.
-//    - Determinar el alcance necesario del brazo.
-//    - Definir la ubicación del brazo respecto a la cinta y al rack.
-//    - Verificar que las posiciones necesarias sean alcanzables.
+// 1. DISEÑO MECANICO DEL BRAZO
+//    DEFINIDO:
+//    - Construccion del brazo en PLA.
+//    - Dimensiones de referencia:
+//        hombro-codo: 120 mm.
+//        codo-muñeca: 100 mm.
+//        muñeca-punta del electroiman: 75-80 mm.
+//    PENDIENTE:
+//    - Completar el modelo 3D, alojamiento de cables y soportes.
+//    - Definir ubicacion de motores, brazo, rack y contenedor.
+//    - Verificar alcance, interferencias y recorridos.
+//    - Documentar y validar con el docente la adaptacion dimensional.
 //
-// 2. SELECCIÓN DE SERVOMOTORES
-//    - Calcular el torque necesario en cada articulación.
-//    - Considerar el peso de los eslabones, servos, electroimán
-//      y piezas transportadas.
-//    - Seleccionar los servomotores definitivos según los resultados.
+// 2. SELECCION Y DISTRIBUCION DE SERVOMOTORES
+//    DISPONIBLE / ENCARGADO:
+//    - DS3225MG, MG995 y MG90S.
+//    REALIZADO:
+//    - Calculo preliminar del torque debido solo al electroiman.
+//    PENDIENTE:
+//    - Calcular torque total con estructura, motores, soportes,
+//      cables y pieza.
+//    - Incorporar efectos del movimiento y margen de diseño.
+//    - Asignar y verificar el servo de cada articulacion.
 //
-// 3. CALIBRACIÓN DE POSICIONES DEL BRAZO
-//    - Definir los ángulos reales de:
-//          HOME
-//          POS_TORNILLO
-//          POS_TUERCA
-//          POS_ARANDELA
-//          POS_CONTENEDOR
-//    - Estos valores se determinarán con el brazo construido.
+// 3. POSICIONES E INICIALIZACION DEL BRAZO
+//    PROGRAMADO:
+//    - Posiciones de recogida y elevacion para cada pieza.
+//    - Posicion sobre el contenedor, deposito y HOME.
+//    - Aproximacion al rack antes de acercarse a la pieza.
+//    - Registro de la ultima posicion ordenada.
+//    - Validacion de limites de referencia y destinos.
+//    - Registro de referencia separado de la orden de inicio.
+//    - Bloqueo del modo fisico mientras BRAZO_CALIBRADO sea false.
+//    PENDIENTE:
+//    - Asignar angulos reales a todas las posiciones.
+//    - Definir como establecer y confirmar la referencia fisica.
+//    - Validar trayectorias; los nombres de los estados no
+//      garantizan movimientos verticales ni ausencia de choques.
+//    - El registro interno no mide la posicion fisica.
 //
-// 4. CALIBRACIÓN DE SERVOMOTORES
-//    - Ajustar los valores PWM mínimos y máximos del PCA9685.
-//    - Verificar los límites mecánicos de cada articulación.
-//    - Evitar movimientos que puedan producir choques o esfuerzos
-//      innecesarios en la estructura.
+// 4. CALIBRACION DE SERVOMOTORES
+//    PROGRAMADO:
+//    - Tabla individual de pulsos y limites para cinco canales.
+//    - Comprobacion de coherencia numerica de la tabla.
+//    - Validacion antes de registrar referencia, iniciar ciclo
+//      y solicitar movimientos progresivos.
+//    PENDIENTE:
+//    - Calibrar pulsos y limites mecanicos de cada servo.
+//    - Verificar sentido de giro y correspondencia de angulos.
+//    - Los valores actuales son provisionales.
 //
-// 5. MOVIMIENTO SUAVE DEL BRAZO
-//    - Implementar movimientos progresivos entre posiciones.
-//    - Reducir movimientos bruscos, vibraciones y golpes.
-//    - Ajustar velocidades según cada articulación.
+// 5. MOVIMIENTO PROGRESIVO DEL BRAZO
+//    PROGRAMADO:
+//    - Pasos de un grado temporizados mediante millis().
+//    - Inicio y actualizacion separados.
+//    - Registro del destino y del movimiento en curso.
+//    - Esperas de asentamiento entre etapas.
+//    - Cancelacion de pasos pendientes al entrar en error.
+//    PENDIENTE:
+//    - Probar movimientos y ajustar tiempos y velocidades.
+//    - Evaluar sincronizacion y perfiles de aceleracion.
+//    - Verificar llegada fisica: terminar de enviar angulos
+//      no confirma que los servos hayan alcanzado el destino.
 //
-// 6. CALIBRACIÓN DEL SENSOR TCS34725
-//    - Obtener experimentalmente las lecturas de los contenedores.
-//    - Registrar los valores de rojo, verde, azul y claro.
-//    - Definir los rangos correspondientes a rojo, verde y azul.
-//    - Completar la función leerColor() utilizando esos valores.
-//    - Evaluar posibles variaciones por iluminación y distancia.
+// 6. IDENTIFICACION DE COLOR - TCS34725
+//    PROGRAMADO:
+//    - Lectura de rojo, verde, azul y claro.
+//    - Hasta tres intentos con intervalo mediante millis().
+//    - Seleccion: rojo-tornillo, verde-tuerca, azul-arandela.
+//    - Registro del resultado de inicializacion del sensor.
+//    - Fallo inicial tratado sin una espera infinita.
+//    PENDIENTE:
+//    - Registrar lecturas reales y definir la clasificacion.
+//    - leerColor() en modo fisico aun devuelve DESCONOCIDO.
+//    - Evaluar iluminacion, distancia y lecturas saturadas.
+//    - Supervisar fallos durante la operacion.
+//    - Revisar el tiempo interno de las lecturas I2C.
 //
-// 7. AJUSTE DEL SENSOR E18-D80NK
-//    - Calibrar la distancia de detección.
-//    - Definir su posición respecto a la cinta transportadora.
-//    - Verificar posibles falsas detecciones.
-//    - Implementar correctamente la interfaz eléctrica con el ESP32.
+// 7. PRESENCIA DEL CONTENEDOR - E18-D80NK
+//    PROGRAMADO:
+//    - Lectura considerada activa en LOW.
+//    - Filtro temporal y validez de la lectura.
+//    - Llegada y salida requieren una lectura estable.
+//    - Alarma por perdida de presencia durante el proceso.
+//    - Alarma por inestabilidad prolongada.
+//    PENDIENTE:
+//    - Verificar interfaz electrica y logica del sensor real.
+//    - Ajustar distancia, ubicacion y tiempos del filtro.
+//    - Confirmar deteccion durante todo el procesamiento.
+//    - Evaluar fallos que produzcan una señal fija.
 //
-// 8. DISEÑO Y CALIBRACIÓN DEL TOPE
-//    - Construir el mecanismo físico de detención del contenedor.
-//    - Ajustar TOPE_ACTIVO y TOPE_LIBRE según el mecanismo real.
-//    - Verificar que el recipiente quede correctamente posicionado.
+// 8. MECANISMO DE TOPE
+//    PROGRAMADO:
+//    - Canal propio y posiciones activa/libre.
+//    - Ordenes integradas al ciclo con esperas mediante millis().
+//    PENDIENTE:
+//    - Construir el mecanismo y calibrar sus angulos.
+//    - Verificar posicionamiento repetible del contenedor.
+//    - Coordinar su accionamiento con la cinta.
 //
-// 9. ELECTROIMÁN
-//    - Seleccionar el electroimán definitivo.
-//    - Diseñar la etapa de potencia necesaria para controlarlo.
-//    - Incorporar los elementos de protección correspondientes.
-//    - Comprobar experimentalmente la capacidad de sujeción de
-//      tornillos, tuercas y arandelas.
+// 9. ELECTROIMAN Y ETAPA DE POTENCIA
+//    IDENTIFICADO:
+//    - Electroiman P25/20, etiqueta de 12 V y sujecion de 8 kg.
+//    - Referencias de catalogo: aproximadamente 56 g,
+//      170 mA y 2 W; verificar en la unidad disponible.
+//    PROGRAMADO:
+//    - Salida configurada y orden inicial de apagado.
+//    - Activacion y desactivacion integradas al ciclo.
+//    - Registro del ultimo estado ordenado.
+//    - El error conserva la orden del electroiman.
+//    - Recuperacion bloqueada si figura activado.
+//    PENDIENTE:
+//    - Diseñar y verificar potencia, alimentacion y protecciones.
+//    - Confirmar polaridad activa del circuito de control.
+//    - Probar toma y liberacion de cada tipo de pieza.
+//    - Definir como resolver una pieza sostenida tras un error.
+//    - La variable interna no confirma corriente ni sujecion.
 //
 // 10. CINTA TRANSPORTADORA
-//     - Definir el motor y el driver utilizados.
-//     - Incorporar el control de marcha y parada desde el ESP32.
-//     - Sincronizar la cinta con el sensor, el tope y el brazo.
+//     PENDIENTE:
+//     - Confirmar motor, alimentacion e interfaz de control.
+//     - Implementar marcha y parada.
+//     - Sincronizar cinta, presencia, tope y movimientos.
+//     - La secuencia actual no controla la cinta.
 //
 // 11. CONTROL DE STOCK
-//     - Incorporar sensores para detectar la disponibilidad de
-//       tornillos, tuercas y arandelas en el rack.
-//     - Evitar solicitar una pieza cuando no exista stock.
-//     - Implementar una pausa general si no queda ninguna pieza.
+//     PENDIENTE:
+//     - Definir sensores y ubicacion para cada tipo de pieza.
+//     - Implementar lectura y validacion de disponibilidad.
+//     - Evitar recogidas sin stock.
+//     - Definir comportamiento si falta una categoria
+//       o si se agota todo el stock.
 //
-// 12. SISTEMA DE RECHAZO / DESVÍO
-//     - Definir físicamente cómo se desviarán los contenedores
-//       que no puedan ser procesados.
-//     - Utilizar este sistema cuando el color no sea reconocido
-//       o cuando no exista stock de la pieza correspondiente.
+// 12. RECHAZO / DESVIO
+//     ACTUAL:
+//     - Color desconocido tras tres intentos conduce a error.
+//     PENDIENTE:
+//     - Definir mecanismo e interfaz de desvio.
+//     - Implementar rechazo por color o falta de stock.
+//     - Coordinar rechazo, cinta y liberacion del contenedor.
 //
-// 13. MANEJO DE ERRORES
-//     - Detectar posibles fallos de sensores.
-//     - Detectar contenedores atascados.
-//     - Evaluar métodos para verificar que la pieza fue recogida.
-//     - Incorporar estados de alarma y recuperación del sistema.
+// 13. ERRORES Y RECUPERACION
+//     PROGRAMADO:
+//     - Registro de la primera causa al entrar en error.
+//     - Errores de seleccion, movimientos, referencia,
+//       presencia, color y demora de salida.
+//     - Parada solicitada por puerto serie.
+//     - Cancelacion del envio progresivo de angulos.
+//     - Recuperacion condicionada a electroiman apagado,
+//       ausencia estable del contenedor, inicializacion del
+//       sensor de color y respuesta I2C del PCA9685.
+//     - Recuperacion invalida la referencia y vuelve a esperar
+//       inicializacion; no reanuda automaticamente el ciclo.
+//     PENDIENTE:
+//     - Probar cada fallo y condicion de recuperacion.
+//     - Completar supervision de dispositivos durante el ciclo.
+//     - Verificar recogida y liberacion efectiva de piezas.
+//     - Respuesta I2C no confirma configuracion ni potencia.
+//     - La parada por software no es una parada de emergencia.
 //
-// 14. OPTIMIZACIÓN DEL PROGRAMA
-//     - Evaluar el reemplazo de delay() por temporización con millis().
-//     - Considerar una máquina de estados para permitir que el ESP32
-//       supervise varias partes del sistema simultáneamente.
+// 14. ORGANIZACION, SIMULACION Y PRUEBAS
+//     PROGRAMADO:
+//     - Maquina de estados para la secuencia principal.
+//     - Temporizacion de pasos y esperas mediante millis().
+//     - Modo de simulacion con salidas fisicas separadas.
+//     - Presencia, color y disponibilidades ficticias.
+//     - Posiciones ficticias separadas de las reales.
+//     - Referencia simulada preparada al iniciar.
+//     - Comandos para presencia y colores simulados.
+//     PENDIENTE:
+//     - Ejecutar y registrar pruebas de ciclos y fallos.
+//     - Completar la nueva referencia simulada despues de r.
+//     - Agregar pruebas de fallos de dispositivos e inestabilidad.
+//     - Retirar las funciones antiguas sin uso:
+//         leerColorConReintentos().
+//         tomarYDepositar().
+//         activarTope().
+//         retirarTope().
+//     - Revisar bloqueos internos y respuesta a comandos.
+//     - Mantener separados resultados simulados y fisicos.
 //
-// 15. INTERFAZ Y SUPERVISIÓN
-//     - Definir la comunicación entre el ESP32 y la interfaz gráfica.
-//     - Mostrar información como:
-//          * Estado del sistema.
-//          * Contenedor detectado.
-//          * Color identificado.
-//          * Pieza seleccionada.
-//          * Estado del stock.
-//          * Alarmas y errores.
-//     - Incorporar funciones de pausa, reinicio o control manual.
+// 15. INTERFAZ Y SUPERVISION
+//     PROGRAMADO POR PUERTO SERIE:
+//     - ?: consulta de estado y ultimo error.
+//     - i: solicitud de inicio.
+//     - p: parada por software.
+//     - r: preparacion de reinicializacion.
+//     - En simulacion:
+//         1: contenedor presente.
+//         0: contenedor ausente.
+//         t: rojo / tornillo.
+//         u: verde / tuerca.
+//         a: azul / arandela.
+//         x: color desconocido.
+//     PENDIENTE:
+//     - Mostrar nombres de estados y pieza seleccionada.
+//     - Incorporar conteo de ciclos y estado de stock.
+//     - Definir comunicacion y desarrollar interfaz grafica.
+//     - Definir control manual y procedimiento de inicializacion.
 //
 // ================================================================
-// NOTA:
-// Los valores actuales correspondientes a posiciones, ángulos,
-// tiempos y PWM son iniciales o provisionales. Los valores definitivos
-// serán determinados mediante cálculos, calibración y pruebas sobre
-// el prototipo físico.
+// NOTA GENERAL
+// ================================================================
+//
+// BRAZO_CALIBRADO debe permanecer en false hasta completar
+// y verificar la calibracion del montaje real.
+//
+// MODO_SIMULACION permite probar logica con datos ficticios;
+// no sustituye pruebas mecanicas, electricas ni de sensores.
+//
+// Pulsos, angulos, tiempos, masas estimadas y umbrales deben
+// ajustarse con el diseño definitivo y las pruebas correspondientes.
+//
 // ================================================================
